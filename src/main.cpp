@@ -3,22 +3,26 @@
 #include <WiFi.h>
 #include <PubSubClient.h>
 
+#include "config.h"
+
 #define RF_RECEIVER_PIN 13 // D13 on DOIT ESP32
 #define RF_EMITTER_PIN 12 // D12 on DOIT ESP32
 #define RF_EMITTER_REPEAT 20
 #define SERIAL_BAUD 115200
 
-#define MQTT_SERVER "10.0.1.22"
-#define MQTT_PORT 1883
-#define MQTT_TOPIC "haaga/status/433toMQTT"
-#define MQTT_CLIENT_ID "homeautomation-433"
 
-#define WIFI_SSID "YOUR_WIFI_HERE"
-#define WIFI_PASSWORD "YOUR_WIFI_PASSWORD_HERE"
 
 WiFiClient wifiClient;
 RCSwitch mySwitch = RCSwitch();
 PubSubClient client(wifiClient);
+QueueHandle_t queue;
+
+struct Message {
+  unsigned long value = 0;
+  int protocol = 0;
+  int bits = 0;
+  int delay = 0;
+};
 
 void print(String str)
 {
@@ -74,44 +78,49 @@ boolean loopRF()
   if (mySwitch.available())
   {
 
-    unsigned long MQTTvalue = 0;
-    int MQTTprotocol = 0;
-    int MQTTbits = 0;
-    int MQTTlength = 0;
+    String taskMessage = "RF Task running on core ";
+    taskMessage = taskMessage + xPortGetCoreID();
+    print(taskMessage);
 
-    MQTTvalue = mySwitch.getReceivedValue();
-    MQTTprotocol = mySwitch.getReceivedProtocol();
-    MQTTbits = mySwitch.getReceivedBitlength();
-    MQTTlength = mySwitch.getReceivedDelay();
+    Message msg;
+
+    msg.value = mySwitch.getReceivedValue();
+    msg.protocol = mySwitch.getReceivedProtocol();
+    msg.bits = mySwitch.getReceivedBitlength();
+    msg.delay = mySwitch.getReceivedDelay();
     mySwitch.resetAvailable();
 
-    if (MQTTvalue !=0 ) {
-        char jsonData[80];
-        sprintf(
-          jsonData,
-          "{\"bits\":%d,\"length\":%d,\"protocol\":%d,\"value\":%lu}",
-          MQTTbits,
-          MQTTlength,
-          MQTTprotocol,
-          MQTTvalue
-        );
-
-        print(String(jsonData));
-
-        return client.publish(MQTT_TOPIC, jsonData);
+    if (msg.value != 0) {
+      xQueueSend(queue, &msg, portMAX_DELAY);
+      return true;
     }
   }
 
   return false;
 }
 
-void setup()
+void queueReadLoop(void *pvParameters)
 {
-  Serial.begin(SERIAL_BAUD);
+  Message msg;
+  while (true)
+  {
+    String taskMessage = "MQTT worker running on core ";
+    taskMessage = taskMessage + xPortGetCoreID();
+    print(taskMessage);
 
-  setupWifi();
-  setupMQTT();
-  setupRF();
+    xQueueReceive(queue, &msg, portMAX_DELAY);
+    char jsonData[80];
+    sprintf(
+      jsonData,
+      "{\"bits\":%d,\"delay\":%d,\"protocol\":%d,\"value\":%lu}",
+      msg.bits,
+      msg.delay,
+      msg.protocol,
+      msg.value
+    );
+    print(String(jsonData));
+    client.publish(MQTT_TOPIC, jsonData);
+  }
 }
 
 void loop()
@@ -122,5 +131,19 @@ void loop()
   }
 
   client.loop();
-  loopRF();
+
+  while (loopRF()) {}
+}
+
+void setup()
+{
+  Serial.begin(SERIAL_BAUD);
+
+  queue = xQueueCreate( 10, sizeof( Message ) );
+
+  setupWifi();
+  setupMQTT();
+  setupRF();
+
+  xTaskCreatePinnedToCore(queueReadLoop, "queueReadLoop", 4096, NULL, 1, NULL, 1);
 }
